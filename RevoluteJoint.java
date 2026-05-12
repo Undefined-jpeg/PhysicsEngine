@@ -10,6 +10,11 @@ public class RevoluteJoint {
     public double motorSpeed = 0;     // Target speed in radians per second
     public double maxTorque = 50000;  // How much force the motor can apply
 
+    public boolean limitEnabled = false;
+    public double lowerAngle = 0;
+    public double upperAngle = 0;
+    public double referenceAngle = 0;
+
     public RevoluteJoint(Ball a, Ball b, Vector2D worldAnchor) {
         this.a = a;
         this.b = b;
@@ -37,13 +42,36 @@ public class RevoluteJoint {
         double massSum = invMassA + invMassB;
 
         if (massSum > 0) {
-            double stiffness = 0.5; // How aggressively it snaps back together
+            double stiffness = 0.5;
             Vector2D correction = error.multiply(stiffness / massSum);
             if (!a.isStatic) a.setPosition(a.getPosition().add(correction.multiply(invMassA)));
             if (!b.isStatic) b.setPosition(b.getPosition().subtract(correction.multiply(invMassB)));
         }
 
-        // 3. Motor Logic (Apply torque to reach target speed)
+        // 3. Angle Limits
+        if (limitEnabled) {
+            double currentAngle = b.getAngle() - a.getAngle() - referenceAngle;
+            // Normalize angle to -PI to PI
+            while (currentAngle > Math.PI) currentAngle -= 2 * Math.PI;
+            while (currentAngle < -Math.PI) currentAngle += 2 * Math.PI;
+
+            if (currentAngle < lowerAngle || currentAngle > upperAngle) {
+                double targetAngle = (currentAngle < lowerAngle) ? lowerAngle : upperAngle;
+                double angleError = targetAngle - currentAngle;
+
+                double invInertiaA = a.isStatic ? 0 : 1.0 / a.getInertia();
+                double invInertiaB = b.isStatic ? 0 : 1.0 / b.getInertia();
+                double inertiaSum = invInertiaA + invInertiaB;
+
+                if (inertiaSum > 0) {
+                    double impulse = angleError * 0.2 / inertiaSum; // Soft limit
+                    if (!a.isStatic) a.setAngularVelocity(a.getAngularVelocity() - impulse * invInertiaA);
+                    if (!b.isStatic) b.setAngularVelocity(b.getAngularVelocity() + impulse * invInertiaB);
+                }
+            }
+        }
+
+        // 4. Motor Logic (Apply torque to reach target speed)
         if (motorEnabled && (!a.isStatic || !b.isStatic)) {
             double relativeAngularVelocity = b.getAngularVelocity() - a.getAngularVelocity();
             double angularError = motorSpeed - relativeAngularVelocity;

@@ -1,14 +1,17 @@
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.HashSet;
 
 public class EngineContainer {
-    private List<Ball> balls = new ArrayList<>();
-    private List<WallBody> walls = new ArrayList<>();
-    private List<Constraint> constraints = new ArrayList<>();
-    private List<WeldConstraint> weldConstraints = new ArrayList<>(); // --- PHASE 11 ---
-    private List<RevoluteJoint> revoluteJoints = new ArrayList<>();
-    private List<Particle> particles = new ArrayList<>();
+    private List<Ball> balls = Collections.synchronizedList(new ArrayList<>());
+    private List<WallBody> walls = Collections.synchronizedList(new ArrayList<>());
+    private List<Constraint> constraints = Collections.synchronizedList(new ArrayList<>());
+    private List<WeldConstraint> weldConstraints = Collections.synchronizedList(new ArrayList<>()); // --- PHASE 11 ---
+    private List<RevoluteJoint> revoluteJoints = Collections.synchronizedList(new ArrayList<>());
+    private List<PrismaticJoint> prismaticJoints = Collections.synchronizedList(new ArrayList<>());
+    private List<WaterZone> waterZones = Collections.synchronizedList(new ArrayList<>());
+    private List<Particle> particles = Collections.synchronizedList(new ArrayList<>());
     
     private List<Ball> logicSpawnQueue = new ArrayList<>();
     
@@ -22,6 +25,8 @@ public class EngineContainer {
     public void addConstraint(Constraint c) { constraints.add(c); }
     public void addWeldConstraint(WeldConstraint w) { weldConstraints.add(w); } // --- PHASE 11 ---
     public void addRevoluteJoint(RevoluteJoint rj) { revoluteJoints.add(rj); }
+    public void addPrismaticJoint(PrismaticJoint pj) { prismaticJoints.add(pj); }
+    public void addWaterZone(WaterZone wz) { waterZones.add(wz); }
     public void addParticle(Particle p) { particles.add(p); }
 
     public void enqueueLogicSpawn(Ball ball) { logicSpawnQueue.add(ball); }
@@ -31,6 +36,8 @@ public class EngineContainer {
     public List<Constraint> getConstraints() { return constraints; }
     public List<WeldConstraint> getWeldConstraints() { return weldConstraints; } // --- PHASE 11 ---
     public List<RevoluteJoint> getRevoluteJoints() { return revoluteJoints; }
+    public List<PrismaticJoint> getPrismaticJoints() { return prismaticJoints; }
+    public List<WaterZone> getWaterZones() { return waterZones; }
     public List<Particle> getParticles() { return particles; }
     
     public void setMouseJoint(SpringConstraint joint) { this.mouseJoint = joint; }
@@ -110,46 +117,68 @@ public class EngineContainer {
     }
 
     public void step(double dt) {
-        for (int i = particles.size() - 1; i >= 0; i--) {
-            Particle p = particles.get(i);
-            p.update(dt);
-            if (p.isDead()) particles.remove(i);
+        synchronized(particles) {
+            for (int i = particles.size() - 1; i >= 0; i--) {
+                Particle p = particles.get(i);
+                p.update(dt);
+                if (p.isDead()) particles.remove(i);
+            }
         }
 
-        int subSteps = 8;
+        int subSteps = 12; // Increased sub-steps for better stability
         double subDt = dt / subSteps;
 
         PhysicsCore.beginFrame();
 
         for (int step = 0; step < subSteps; step++) {
-            for (Ball ball : balls) ball.update(subDt);
-            if (mouseJoint != null) mouseJoint.solve(subDt);
-
-            for (int i = 0; i < 3; i++) {
-                for (Constraint c : constraints) c.solve();
-                for (WeldConstraint w : weldConstraints) w.solve(); // --- PHASE 11 ---
-                for (RevoluteJoint rj : revoluteJoints) rj.solve(subDt);
-            }
-
-            for (Ball ball : balls) {
-                if (ball.isSleeping && !ball.isStatic) continue;
-                if (ball.isNoClip) continue; 
-                AABB ballBox = ball.getAABB(); 
-                for (WallBody wall : walls) {
-                    if (ballBox.intersects(wall.getAABB())) {
-                        PhysicsCore.applyCCDWallCollision(ball, wall);
-                        PhysicsCore.resolvePolygonWallCollision(ball, wall);
+            synchronized(balls) {
+                for (Ball ball : balls) {
+                    ball.update(subDt);
+                    synchronized(waterZones) {
+                        for (WaterZone wz : waterZones) wz.apply(ball, subDt);
                     }
                 }
             }
+            if (mouseJoint != null) mouseJoint.solve(subDt);
 
-            if (!balls.isEmpty()) {
-                double totalRadius = 0;
-                for (Ball ball : balls) totalRadius += ball.getRadius();
-                spatialHash.setCellSize((totalRadius / balls.size()) * 2.0);
+            for (int i = 0; i < 6; i++) { // Increased constraint iterations
+                synchronized(constraints) {
+                    for (Constraint c : constraints) c.solve();
+                }
+                synchronized(weldConstraints) {
+                    for (WeldConstraint w : weldConstraints) w.solve(); // --- PHASE 11 ---
+                }
+                synchronized(revoluteJoints) {
+                    for (RevoluteJoint rj : revoluteJoints) rj.solve(subDt);
+                }
+                synchronized(prismaticJoints) {
+                    for (PrismaticJoint pj : prismaticJoints) pj.solve(subDt);
+                }
             }
-            spatialHash.clear();
-            for (Ball ball : balls) spatialHash.insert(ball);
+
+            synchronized(balls) {
+                for (Ball ball : balls) {
+                    if (ball.isSleeping && !ball.isStatic) continue;
+                    if (ball.isNoClip) continue;
+                    AABB ballBox = ball.getAABB();
+                    synchronized(walls) {
+                        for (WallBody wall : walls) {
+                            if (ballBox.intersects(wall.getAABB())) {
+                                PhysicsCore.applyCCDWallCollision(ball, wall);
+                                PhysicsCore.resolvePolygonWallCollision(ball, wall);
+                            }
+                        }
+                    }
+                }
+
+                if (!balls.isEmpty()) {
+                    double totalRadius = 0;
+                    for (Ball ball : balls) totalRadius += ball.getRadius();
+                    spatialHash.setCellSize((totalRadius / balls.size()) * 2.0);
+                }
+                spatialHash.clear();
+                for (Ball ball : balls) spatialHash.insert(ball);
+            }
             HashSet<Long> checkedPairs = new HashSet<>();
 
             for (List<Ball> cellBalls : spatialHash.getGrid().values()) {
@@ -194,24 +223,27 @@ public class EngineContainer {
         List<Ball> newShards = new ArrayList<>();
         List<Ball> destroyed = new ArrayList<>();
         
-        for (Ball b : balls) {
-            if (b.isDestroyed) {
-                destroyed.add(b);
-                newShards.addAll(b.shatter());
-                int particleCount = (int)(b.getRadius() * 1.5);
-                for (int i = 0; i < particleCount; i++) {
-                    Vector2D randomVel = new Vector2D((Math.random() - 0.5) * 800, (Math.random() - 0.5) * 800);
-                    java.awt.Color pColor = new java.awt.Color(200, 220, 255, 200); 
-                    particles.add(new Particle(b.getPosition(), randomVel, 0.5 + Math.random(), 2 + Math.random() * 4, pColor));
+        synchronized(balls) {
+            for (Ball b : balls) {
+                if (b.isDestroyed) {
+                    destroyed.add(b);
+                    newShards.addAll(b.shatter());
+                    int particleCount = (int)(b.getRadius() * 1.5);
+                    for (int i = 0; i < particleCount; i++) {
+                        Vector2D randomVel = new Vector2D((Math.random() - 0.5) * 800, (Math.random() - 0.5) * 800);
+                        java.awt.Color pColor = new java.awt.Color(200, 220, 255, 200);
+                        particles.add(new Particle(b.getPosition(), randomVel, 0.5 + Math.random(), 2 + Math.random() * 4, pColor));
+                    }
                 }
             }
         }
 
         if (!destroyed.isEmpty()) {
-            balls.removeAll(destroyed);
-            constraints.removeIf(c -> c.a.isDestroyed || c.b.isDestroyed);
-            weldConstraints.removeIf(w -> w.a.isDestroyed || w.b.isDestroyed); // --- PHASE 11 ---
-            revoluteJoints.removeIf(rj -> rj.a.isDestroyed || rj.b.isDestroyed);
+            synchronized(balls) { balls.removeAll(destroyed); }
+            synchronized(constraints) { constraints.removeIf(c -> c.a.isDestroyed || c.b.isDestroyed); }
+            synchronized(weldConstraints) { weldConstraints.removeIf(w -> w.a.isDestroyed || w.b.isDestroyed); }
+            synchronized(revoluteJoints) { revoluteJoints.removeIf(rj -> rj.a.isDestroyed || rj.b.isDestroyed); }
+            synchronized(prismaticJoints) { prismaticJoints.removeIf(pj -> pj.a.isDestroyed || pj.b.isDestroyed); }
             if (mouseJoint != null && mouseJoint.body.isDestroyed) mouseJoint = null;
             
             for (Ball d : destroyed) {
@@ -220,7 +252,7 @@ public class EngineContainer {
                     for (LogicNode out : d.logicNode.connectedOutputs) out.connectedInputs.remove(d.logicNode);
                 }
             }
-            balls.addAll(newShards);
+            synchronized(balls) { balls.addAll(newShards); }
         }
     }
 }

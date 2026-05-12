@@ -78,6 +78,8 @@ public class Ball {
         else if (!isStatic) this.invI = 1.0 / this.momentOfInertia;
     }
 
+    public static Vector2D windVector = new Vector2D(0, 0);
+
     public void update(double dt) {
         if (isStatic) {
             if (hasMotor) angle += motorSpeed * dt;
@@ -90,9 +92,14 @@ public class Ball {
 
         if (hasMotor) angularVelocity = motorSpeed;
 
-        velocity = velocity.add(new Vector2D(0, 1000.0 * dt)); 
-        velocity = velocity.multiply(0.999); 
-        angularVelocity *= 0.99; 
+        // Gravity
+        velocity = velocity.add(new Vector2D(0, PhysicsCore.GRAVITY * dt));
+
+        // Aerodynamics (Lift and Drag)
+        applyAerodynamics(dt);
+
+        velocity = velocity.multiply(0.9995);
+        angularVelocity *= 0.995;
 
         position = position.add(velocity.multiply(dt));
         angle += angularVelocity * dt;
@@ -179,6 +186,30 @@ public class Ball {
             transformed[i] = position.add(localVertices[i].rotate(angle));
         }
         return transformed;
+    }
+
+    private void applyAerodynamics(double dt) {
+        Vector2D relVel = velocity.subtract(windVector);
+        double speedSq = relVel.lengthSquared();
+        if (speedSq < 0.001) return;
+
+        double speed = Math.sqrt(speedSq);
+        Vector2D dir = relVel.multiply(1.0 / speed);
+
+        // Simple area-based drag
+        double area = (shape == ShapeType.CIRCLE) ? radius * 2 : radius * 2.5;
+        double dragCoeff = 0.47; // Sphere-like
+        double dragMag = 0.5 * 1.225 * speedSq * dragCoeff * area * 0.0001; // Scale factor for engine
+
+        velocity = velocity.subtract(dir.multiply(dragMag * dt * invMass));
+
+        // Lift (very basic approximation for non-circles)
+        if (shape != ShapeType.CIRCLE) {
+            Vector2D liftDir = new Vector2D(-dir.y, dir.x);
+            double liftCoeff = Math.sin(angle * 2); // Angle of attack approx
+            double liftMag = 0.5 * 1.225 * speedSq * liftCoeff * area * 0.0001;
+            velocity = velocity.add(liftDir.multiply(liftMag * dt * invMass));
+        }
     }
 
     public AABB getAABB() {
