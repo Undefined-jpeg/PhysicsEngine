@@ -35,4 +35,10 @@ public class SaveData {
         public int outputNodeBallId;
         public int inputNodeBallId;
     }
+
+    public static class Prefab {
+        public List<SavedBall> balls = new ArrayList<>();
+        public List<SavedJoint> joints = new ArrayList<>();
+        public List<SavedWire> wires = new ArrayList<>();
+    }
 }

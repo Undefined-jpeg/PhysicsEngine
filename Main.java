@@ -1,3 +1,5 @@
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
@@ -14,12 +16,13 @@ public class Main extends JPanel implements ActionListener {
     public enum SpawnType { 
         PHYSICS_STEEL_CUBE, PHYSICS_WOOD_TRI, PHYSICS_RUBBER_BALL, PHYSICS_GLASS, 
         INPUT_BUTTON, INPUT_PRESSURE_PLATE, INPUT_TRIPWIRE, INPUT_SENSOR, 
+        INPUT_PROXIMITY, INPUT_SPEEDOMETER,
         INPUT_KEY_W, INPUT_KEY_A, INPUT_KEY_S, INPUT_KEY_D, 
         OUTPUT_DOOR, OUTPUT_PLATFORM, OUTPUT_PISTON, OUTPUT_CANNON,
         OUTPUT_THRUSTER, OUTPUT_TNT, OUTPUT_MOTOR, OUTPUT_LASER, OUTPUT_SPAWNER,
         OUTPUT_HOVER, OUTPUT_ATTRACTOR, OUTPUT_VOID, 
         LOGIC_POWER_SOURCE, LOGIC_LIGHTBULB, 
-        LOGIC_AND, LOGIC_OR, LOGIC_NOT, LOGIC_XOR, LOGIC_TOGGLE, GATE_DELAY, GATE_TIMER, GATE_COUNTER, LOGIC_SR_LATCH
+        LOGIC_AND, LOGIC_OR, LOGIC_NOT, LOGIC_XOR, LOGIC_TOGGLE, GATE_DELAY, GATE_TIMER, GATE_COUNTER, LOGIC_SR_LATCH, LOGIC_RELAY
     }
     
     private ToolMode currentMode = ToolMode.DRAG;
@@ -28,6 +31,7 @@ public class Main extends JPanel implements ActionListener {
     private Ball linkStartNode = null; 
 
     private boolean isPlaying = true; 
+    private double timeScale = 1.0;
     private boolean debugMode = false;
 
     private Ball activePlayer = null;
@@ -41,6 +45,8 @@ public class Main extends JPanel implements ActionListener {
     private double placementRotation = 0.0;
 
     private List<Vector2D> customShapePoints = new ArrayList<>();
+    private List<Ball> selectedBalls = new ArrayList<>();
+    private Point selectionStart = null;
     private BallData clipboardData = null; 
 
     private double camX = 0, camY = 0;
@@ -61,16 +67,60 @@ public class Main extends JPanel implements ActionListener {
     private static final BasicStroke WALL_STROKE = new BasicStroke(4);
     private static final Font UI_FONT = new Font("Monospaced", Font.BOLD, 14);
 
+    private Thread physicsThread;
+    private volatile boolean running = true;
+
     public Main(int screenWidth, int screenHeight) {
         engine = new EngineContainer();
+        try {
+            audioEngine = new AudioEngine();
+            audioEngine.loadSound("thud", "sounds/thud.ogg");
+            audioEngine.loadSound("place", "sounds/place.ogg");
+            audioEngine.loadSound("delete", "sounds/delete.ogg");
+            PhysicsCore.audioEngine = audioEngine;
+        } catch (Exception e) {
+            System.err.println("Audio initialization failed: " + e.getMessage());
+        }
         setFocusable(true);
         setBackground(BG_COLOR);
 
         engine.addWallSegment(new Vector2D(-2000, 500), new Vector2D(2000, 500));
+        engine.addWaterZone(new WaterZone(500, 0, 1500, 500));
         spawnPlayer();
 
         setupMouseControls();
         setupKeyboardControls();
+
+        // Multithreading: Physics and Logic on a separate thread
+        physicsThread = new Thread(() -> {
+            while (running) {
+                if (isPlaying) {
+                    long start = System.nanoTime();
+
+                    if (activePlayer != null && !activePlayer.isDestroyed) {
+                        Vector2D vel = activePlayer.getVelocity(); double targetVx = 0, targetVy = 0;
+                        if (keyA) targetVx = -500; if (keyD) targetVx = 500;
+                        if (keyW) targetVy = -500; if (keyS) targetVy = 500;
+                        activePlayer.setVelocity(new Vector2D(vel.x + (targetVx - vel.x) * 0.15, vel.y + (targetVy - vel.y) * 0.15));
+                        activePlayer.wakeUp();
+                    }
+
+                    engine.step(0.016 * timeScale);
+
+                    if (activePlayer != null && !activePlayer.isDestroyed) {
+                        camX += (activePlayer.getPosition().x - camX) * 0.05;
+                        camY += (activePlayer.getPosition().y - camY) * 0.05;
+                    }
+
+                    long end = System.nanoTime();
+                    long sleep = 16 - (end - start) / 1000000;
+                    if (sleep > 0) try { Thread.sleep(sleep); } catch (InterruptedException ex) {}
+                } else {
+                    try { Thread.sleep(16); } catch (InterruptedException ex) {}
+                }
+            }
+        });
+        physicsThread.start();
 
         timer = new Timer(16, this);
         timer.start();
@@ -108,15 +158,29 @@ public class Main extends JPanel implements ActionListener {
 
                 if (SwingUtilities.isLeftMouseButton(e)) {
                     if (clickedBall != null && clickedBall != activePlayer && currentMode != ToolMode.CONFIGURE && currentMode != ToolMode.SHOOT && currentMode != ToolMode.DELETE && currentMode != ToolMode.LINK && currentMode != ToolMode.DRAW) {
-                        SpringConstraint joint = new SpringConstraint(clickedBall, worldClick, 5000.0, 200.0);
-                        engine.setMouseJoint(joint);
-                        return; 
+                        if (selectedBalls.contains(clickedBall)) {
+                            // Start moving group
+                        } else {
+                            selectedBalls.clear();
+                            SpringConstraint joint = new SpringConstraint(clickedBall, worldClick, 5000.0, 200.0);
+                            engine.setMouseJoint(joint);
+                            return;
+                        }
+                    }
+
+                    if (currentMode == ToolMode.DRAG && clickedBall == null) {
+                        selectionStart = e.getPoint();
                     }
 
                     switch (currentMode) {
                         case DRAG -> {} 
                         case PLACE -> spawnEntity(worldClick);
-                        case DELETE -> { if (clickedBall != null && clickedBall != activePlayer) clickedBall.isDestroyed = true; }
+                        case DELETE -> {
+                            if (clickedBall != null && clickedBall != activePlayer) {
+                                CommandHistory.executeCommand(new DeleteBallCommand(engine, clickedBall));
+                                if (audioEngine != null) audioEngine.playSound("delete", 1.0f, 1.0f);
+                            }
+                        }
                         case SHOOT -> {
                             Vector2D rayOrigin = activePlayer != null ? activePlayer.getPosition() : screenToWorld(new Point(getWidth()/2, getHeight()/2));
                             Vector2D dir = worldClick.subtract(rayOrigin).normalize();
@@ -127,14 +191,17 @@ public class Main extends JPanel implements ActionListener {
                         case CONFIGURE -> {
                             if (clickedBall != null && clickedBall.logicNode != null) {
                                 if (wireStartNode == null) wireStartNode = clickedBall.logicNode;
-                                else { wireStartNode.addConnectionTo(clickedBall.logicNode); wireStartNode = null; }
+                                else {
+                                    CommandHistory.executeCommand(new WireCommand(wireStartNode, clickedBall.logicNode));
+                                    wireStartNode = null;
+                                }
                             } else wireStartNode = null; 
                         }
                         case LINK -> {
                             if (clickedBall != null && clickedBall != activePlayer) {
                                 if (linkStartNode == null) linkStartNode = clickedBall;
                                 else if (linkStartNode != clickedBall) {
-                                    engine.addWeldConstraint(new WeldConstraint(linkStartNode, clickedBall));
+                                    CommandHistory.executeCommand(new JointCommand(engine, new WeldConstraint(linkStartNode, clickedBall)));
                                     linkStartNode = null;
                                 }
                             } else linkStartNode = null;
@@ -148,16 +215,40 @@ public class Main extends JPanel implements ActionListener {
             @Override
             public void mouseReleased(MouseEvent e) {
                 if (SwingUtilities.isRightMouseButton(e)) lastMousePan = null;
-                if (SwingUtilities.isLeftMouseButton(e) && engine.getMouseJoint() != null) engine.setMouseJoint(null);
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    if (engine.getMouseJoint() != null) engine.setMouseJoint(null);
+                    if (selectionStart != null) {
+                        Vector2D worldStart = screenToWorld(selectionStart);
+                        Vector2D worldEnd = screenToWorld(e.getPoint());
+                        AABB selectionBox = new AABB(Math.min(worldStart.x, worldEnd.x), Math.min(worldStart.y, worldEnd.y), Math.max(worldStart.x, worldEnd.x), Math.max(worldStart.y, worldEnd.y));
+                        selectedBalls.clear();
+                        for (Ball b : engine.getBalls()) {
+                            if (b != activePlayer && selectionBox.intersects(b.getAABB())) {
+                                selectedBalls.add(b);
+                            }
+                        }
+                        selectionStart = null;
+                    }
+                }
             }
             @Override
             public void mouseDragged(MouseEvent e) {
+                Vector2D prevMouseWorldPos = currentMouseWorldPos;
                 currentMouseWorldPos = screenToWorld(e.getPoint());
                 hoveredBall = getBallAt(currentMouseWorldPos); 
+
                 if (SwingUtilities.isRightMouseButton(e) && lastMousePan != null) {
                     camX -= (e.getX() - lastMousePan.x) / zoom;
                     camY -= (e.getY() - lastMousePan.y) / zoom;
                     lastMousePan = e.getPoint();
+                }
+
+                if (SwingUtilities.isLeftMouseButton(e) && selectionStart == null && !selectedBalls.isEmpty() && engine.getMouseJoint() == null) {
+                    Vector2D delta = currentMouseWorldPos.subtract(prevMouseWorldPos);
+                    for (Ball b : selectedBalls) {
+                        b.setPosition(b.getPosition().add(delta));
+                        b.setVelocity(new Vector2D(0, 0));
+                    }
                 }
             }
             @Override
@@ -172,6 +263,123 @@ public class Main extends JPanel implements ActionListener {
             }
         };
         addMouseListener(mouse); addMouseMotionListener(mouse); addMouseWheelListener(mouse);
+    }
+
+    private void savePrefab() {
+        if (selectedBalls.isEmpty()) return;
+
+        SaveData.Prefab prefab = new SaveData.Prefab();
+        List<Ball> list = new ArrayList<>(selectedBalls);
+
+        for (Ball b : list) {
+            SaveData.SavedBall sb = new SaveData.SavedBall();
+            sb.id = b.id;
+            sb.x = b.getPosition().x; sb.y = b.getPosition().y;
+            sb.radius = b.getRadius(); sb.angle = b.getAngle();
+            sb.materialType = b.material.name();
+            sb.shapeType = b.shape.name();
+            sb.isStatic = b.isStatic;
+            if (b.logicNode != null) {
+                sb.logicNodeType = b.logicNode.type.name();
+                sb.nodeOutputSpeed = b.logicNode.outputSpeed;
+                sb.nodeDelayTicks = b.logicNode.delayTicks;
+            }
+            prefab.balls.add(sb);
+        }
+
+        // Add constraints between selected balls
+        for (Constraint c : engine.getConstraints()) {
+            if (list.contains(c.a) && list.contains(c.b)) {
+                SaveData.SavedJoint sj = new SaveData.SavedJoint();
+                sj.type = "SPRING";
+                sj.ballIdA = c.a.id; sj.ballIdB = c.b.id;
+                sj.springRestLength = c.targetLength;
+                prefab.joints.add(sj);
+            }
+        }
+
+        for (WeldConstraint w : engine.getWeldConstraints()) {
+            if (list.contains(w.a) && list.contains(w.b)) {
+                SaveData.SavedJoint sj = new SaveData.SavedJoint();
+                sj.type = "WELD";
+                sj.ballIdA = w.a.id; sj.ballIdB = w.b.id;
+                prefab.joints.add(sj);
+            }
+        }
+
+        // Add wires
+        for (Ball b : list) {
+            if (b.logicNode != null) {
+                for (LogicNode out : b.logicNode.connectedOutputs) {
+                    if (list.contains(out.parentBody)) {
+                        SaveData.SavedWire sw = new SaveData.SavedWire();
+                        sw.outputNodeBallId = b.id;
+                        sw.inputNodeBallId = out.parentBody.id;
+                        prefab.wires.add(sw);
+                    }
+                }
+            }
+        }
+
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        String json = gson.toJson(prefab);
+
+        JFileChooser fileChooser = new JFileChooser();
+        if (fileChooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try (java.io.FileWriter writer = new java.io.FileWriter(fileChooser.getSelectedFile())) {
+                writer.write(json);
+            } catch (Exception ex) { ex.printStackTrace(); }
+        }
+    }
+
+    private void loadPrefab() {
+        JFileChooser fileChooser = new JFileChooser();
+        if (fileChooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try (java.io.FileReader reader = new java.io.FileReader(fileChooser.getSelectedFile())) {
+                Gson gson = new Gson();
+                SaveData.Prefab prefab = gson.fromJson(reader, SaveData.Prefab.class);
+
+                java.util.Map<Integer, Ball> idMap = new java.util.HashMap<>();
+                Vector2D center = currentMouseWorldPos;
+
+                // Calculate original center of prefab to offset it to mouse
+                double avgX = 0, avgY = 0;
+                for (SaveData.SavedBall sb : prefab.balls) { avgX += sb.x; avgY += sb.y; }
+                avgX /= prefab.balls.size(); avgY /= prefab.balls.size();
+                Vector2D offset = center.subtract(new Vector2D(avgX, avgY));
+
+                for (SaveData.SavedBall sb : prefab.balls) {
+                    Ball b = new Ball(sb.x + offset.x, sb.y + offset.y, sb.radius, Material.valueOf(sb.materialType));
+                    b.setShape(Ball.ShapeType.valueOf(sb.shapeType));
+                    b.setAngle(sb.angle);
+                    b.isStatic = sb.isStatic;
+                    if (sb.logicNodeType != null) {
+                        b.logicNode = new LogicNode(b, LogicNode.NodeType.valueOf(sb.logicNodeType));
+                        b.logicNode.outputSpeed = sb.nodeOutputSpeed;
+                        b.logicNode.delayTicks = sb.nodeDelayTicks;
+                    }
+                    engine.addBall(b);
+                    idMap.put(sb.id, b);
+                }
+
+                for (SaveData.SavedJoint sj : prefab.joints) {
+                    Ball a = idMap.get(sj.ballIdA);
+                    Ball b = idMap.get(sj.ballIdB);
+                    if (a != null && b != null) {
+                        if ("SPRING".equals(sj.type)) engine.addConstraint(new Constraint(a, b, sj.springRestLength, 0.1, 0.05));
+                        else if ("WELD".equals(sj.type)) engine.addWeldConstraint(new WeldConstraint(a, b));
+                    }
+                }
+
+                for (SaveData.SavedWire sw : prefab.wires) {
+                    Ball out = idMap.get(sw.outputNodeBallId);
+                    Ball in = idMap.get(sw.inputNodeBallId);
+                    if (out != null && in != null && out.logicNode != null && in.logicNode != null) {
+                        out.logicNode.addConnectionTo(in.logicNode);
+                    }
+                }
+            } catch (Exception ex) { ex.printStackTrace(); }
+        }
     }
 
     private void finishCustomShape() {
@@ -268,65 +476,72 @@ public class Main extends JPanel implements ActionListener {
     }
 
     private void spawnEntity(Vector2D pos) {
-        Ball b;
-        int previousCount = engine.getBalls().size();
+        if (audioEngine != null) audioEngine.playSound("place", 1.0f, 1.0f);
+        Ball b = null;
 
         switch (currentSpawn) {
-            case PHYSICS_STEEL_CUBE -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); engine.addBall(b); }
-            case PHYSICS_WOOD_TRI -> { b = new Ball(pos.x, pos.y, 30, Material.WOOD); b.setShape(Ball.ShapeType.TRIANGLE); engine.addBall(b); }
-            case PHYSICS_RUBBER_BALL -> { b = new Ball(pos.x, pos.y, 15, Material.RUBBER); engine.addBall(b); }
-            case PHYSICS_GLASS -> { b = new Ball(pos.x, pos.y, 35, Material.GLASS); b.setShape(Ball.ShapeType.CUBE); engine.addBall(b); }
+            case PHYSICS_STEEL_CUBE -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); }
+            case PHYSICS_WOOD_TRI -> { b = new Ball(pos.x, pos.y, 30, Material.WOOD); b.setShape(Ball.ShapeType.TRIANGLE); }
+            case PHYSICS_RUBBER_BALL -> { b = new Ball(pos.x, pos.y, 15, Material.RUBBER); }
+            case PHYSICS_GLASS -> { b = new Ball(pos.x, pos.y, 35, Material.GLASS); b.setShape(Ball.ShapeType.CUBE); }
             
-            case INPUT_BUTTON -> { b = new Ball(pos.x, pos.y, 14, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_BUTTON); engine.addBall(b); }
-            case INPUT_PRESSURE_PLATE -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_PRESSURE_PLATE); engine.addBall(b); }
+            case INPUT_BUTTON -> { b = new Ball(pos.x, pos.y, 14, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_BUTTON); }
+            case INPUT_PRESSURE_PLATE -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_PRESSURE_PLATE); }
             case INPUT_TRIPWIRE -> {
-                Ball p1 = new Ball(pos.x - 60, pos.y, 10, Material.STEEL); p1.setShape(Ball.ShapeType.CUBE); p1.logicNode = new LogicNode(p1, LogicNode.NodeType.INPUT_TRIPWIRE); engine.addBall(p1);
-                Ball p2 = new Ball(pos.x + 60, pos.y, 10, Material.STEEL); p2.setShape(Ball.ShapeType.CUBE); p2.logicNode = new LogicNode(p2, LogicNode.NodeType.INPUT_TRIPWIRE); engine.addBall(p2);
+                Ball p1 = new Ball(pos.x - 60, pos.y, 10, Material.STEEL); p1.setShape(Ball.ShapeType.CUBE); p1.logicNode = new LogicNode(p1, LogicNode.NodeType.INPUT_TRIPWIRE);
+                Ball p2 = new Ball(pos.x + 60, pos.y, 10, Material.STEEL); p2.setShape(Ball.ShapeType.CUBE); p2.logicNode = new LogicNode(p2, LogicNode.NodeType.INPUT_TRIPWIRE);
                 p1.logicNode.pairedNode = p2.logicNode; p2.logicNode.pairedNode = p1.logicNode;
+                CommandHistory.executeCommand(new PlaceBallCommand(engine, p1));
+                CommandHistory.executeCommand(new PlaceBallCommand(engine, p2));
                 engine.addConstraint(new Constraint(p1, p2, 120, 0.1, 0.05));
+                return;
             }
-            case INPUT_SENSOR -> { b = new Ball(pos.x, pos.y, 22, Material.GLASS); b.setShape(Ball.ShapeType.HEXAGON); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_SENSOR); engine.addBall(b); }
+            case INPUT_SENSOR -> { b = new Ball(pos.x, pos.y, 22, Material.GLASS); b.setShape(Ball.ShapeType.HEXAGON); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_SENSOR); }
+            case INPUT_PROXIMITY -> { b = new Ball(pos.x, pos.y, 20, Material.GLASS); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_PROXIMITY); b.logicNode.outputDistance = 200; }
+            case INPUT_SPEEDOMETER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_SPEEDOMETER); b.logicNode.outputSpeed = 500; }
 
-            case INPUT_KEY_W -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_W); engine.addBall(b); }
-            case INPUT_KEY_A -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_A); engine.addBall(b); }
-            case INPUT_KEY_S -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_S); engine.addBall(b); }
-            case INPUT_KEY_D -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_D); engine.addBall(b); }
+            case INPUT_KEY_W -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_W); }
+            case INPUT_KEY_A -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_A); }
+            case INPUT_KEY_S -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_S); }
+            case INPUT_KEY_D -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.INPUT_KEY_D); }
 
-            case OUTPUT_DOOR -> { b = new Ball(pos.x, pos.y, 40, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_DOOR); engine.addBall(b); }
+            case OUTPUT_DOOR -> { b = new Ball(pos.x, pos.y, 40, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_DOOR); }
             case OUTPUT_PLATFORM -> {
                 b = new Ball(pos.x, pos.y, 40, Material.STEEL); b.isStatic = true;
                 b.setCustomVertices(new Vector2D[]{ new Vector2D(-80, -10), new Vector2D(80, -10), new Vector2D(80, 10), new Vector2D(-80, 10) });
-                b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_PLATFORM); b.logicNode.outputDirection = new Vector2D(1, 0); b.logicNode.outputDistance = 300.0; engine.addBall(b);
+                b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_PLATFORM); b.logicNode.outputDirection = new Vector2D(1, 0); b.logicNode.outputDistance = 300.0;
             }
-            case OUTPUT_PISTON -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_PISTON); b.logicNode.outputSpeed = 2000.0; engine.addBall(b); }
-            case OUTPUT_CANNON -> { b = new Ball(pos.x, pos.y, 35, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_CANNON); b.logicNode.outputSpeed = 2000.0; engine.addBall(b); }
+            case OUTPUT_PISTON -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_PISTON); b.logicNode.outputSpeed = 2000.0; }
+            case OUTPUT_CANNON -> { b = new Ball(pos.x, pos.y, 35, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_CANNON); b.logicNode.outputSpeed = 2000.0; }
             case OUTPUT_THRUSTER -> {
                 b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setCustomVertices(new Vector2D[]{ new Vector2D(-15, 20), new Vector2D(15, 20), new Vector2D(10, -20), new Vector2D(-10, -20) });
-                b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_THRUSTER); b.logicNode.outputDirection = new Vector2D(0, -1); b.logicNode.outputSpeed = 1500.0; engine.addBall(b);
+                b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_THRUSTER); b.logicNode.outputDirection = new Vector2D(0, -1); b.logicNode.outputSpeed = 1500.0;
             }
-            case OUTPUT_TNT -> { b = new Ball(pos.x, pos.y, 25, Material.WOOD); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_TNT); engine.addBall(b); }
-            case OUTPUT_MOTOR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_MOTOR); b.logicNode.outputSpeed = 500.0; engine.addBall(b); }
-            case OUTPUT_LASER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_LASER); b.logicNode.outputDirection = new Vector2D(1, 0); engine.addBall(b); }
-            case OUTPUT_SPAWNER -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_SPAWNER); b.logicNode.outputDirection = new Vector2D(0, 1); engine.addBall(b); }
-            case OUTPUT_HOVER -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_HOVER); b.logicNode.outputSpeed = 200.0; engine.addBall(b); }
-            case OUTPUT_ATTRACTOR -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_ATTRACTOR); b.logicNode.outputSpeed = 1000.0; engine.addBall(b); }
-            case OUTPUT_VOID -> { b = new Ball(pos.x, pos.y, 35, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_VOID); engine.addBall(b); }
+            case OUTPUT_TNT -> { b = new Ball(pos.x, pos.y, 25, Material.WOOD); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_TNT); }
+            case OUTPUT_MOTOR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_MOTOR); b.logicNode.outputSpeed = 500.0; }
+            case OUTPUT_LASER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_LASER); b.logicNode.outputDirection = new Vector2D(1, 0); }
+            case OUTPUT_SPAWNER -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_SPAWNER); b.logicNode.outputDirection = new Vector2D(0, 1); }
+            case OUTPUT_HOVER -> { b = new Ball(pos.x, pos.y, 25, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_HOVER); b.logicNode.outputSpeed = 200.0; }
+            case OUTPUT_ATTRACTOR -> { b = new Ball(pos.x, pos.y, 30, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_ATTRACTOR); b.logicNode.outputSpeed = 1000.0; }
+            case OUTPUT_VOID -> { b = new Ball(pos.x, pos.y, 35, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.isStatic = true; b.logicNode = new LogicNode(b, LogicNode.NodeType.OUTPUT_VOID); }
 
-            case LOGIC_POWER_SOURCE -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.POWER_SOURCE); engine.addBall(b); }
-            case LOGIC_LIGHTBULB -> { b = new Ball(pos.x, pos.y, 18, Material.GLASS); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.LIGHTBULB); engine.addBall(b); }
-            case LOGIC_AND -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_AND); engine.addBall(b); }
-            case LOGIC_OR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_OR); engine.addBall(b); }
-            case LOGIC_NOT -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.TRIANGLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_NOT); engine.addBall(b); }
-            case LOGIC_XOR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_XOR); engine.addBall(b); }
-            case LOGIC_TOGGLE -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_TOGGLE); engine.addBall(b); }
-            case GATE_DELAY -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_DELAY); engine.addBall(b); }
-            case GATE_TIMER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_TIMER); engine.addBall(b); }
-            case GATE_COUNTER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_COUNTER); engine.addBall(b); }
-            case LOGIC_SR_LATCH -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.SR_LATCH); engine.addBall(b); }
+            case LOGIC_POWER_SOURCE -> { b = new Ball(pos.x, pos.y, 18, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.POWER_SOURCE); }
+            case LOGIC_LIGHTBULB -> { b = new Ball(pos.x, pos.y, 18, Material.GLASS); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.LIGHTBULB); }
+            case LOGIC_AND -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_AND); }
+            case LOGIC_OR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_OR); }
+            case LOGIC_NOT -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.TRIANGLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_NOT); }
+            case LOGIC_XOR -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.HEXAGON); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_XOR); }
+            case LOGIC_TOGGLE -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_TOGGLE); }
+            case GATE_DELAY -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_DELAY); }
+            case GATE_TIMER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_TIMER); }
+            case GATE_COUNTER -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.GATE_COUNTER); }
+            case LOGIC_SR_LATCH -> { b = new Ball(pos.x, pos.y, 20, Material.STEEL); b.setShape(Ball.ShapeType.CUBE); b.logicNode = new LogicNode(b, LogicNode.NodeType.SR_LATCH); }
+            case LOGIC_RELAY -> { b = new Ball(pos.x, pos.y, 10, Material.STEEL); b.setShape(Ball.ShapeType.CIRCLE); b.logicNode = new LogicNode(b, LogicNode.NodeType.RELAY); }
         }
 
-        for (int i = previousCount; i < engine.getBalls().size(); i++) {
-            engine.getBalls().get(i).setAngle(placementRotation);
+        if (b != null) {
+            b.setAngle(placementRotation);
+            CommandHistory.executeCommand(new PlaceBallCommand(engine, b));
         }
     }
 
@@ -335,6 +550,13 @@ public class Main extends JPanel implements ActionListener {
             @Override
             public void keyPressed(KeyEvent e) {
                 if (e.getKeyCode() == KeyEvent.VK_SPACE) isPlaying = !isPlaying;
+                if (e.getKeyCode() == KeyEvent.VK_T) timeScale = (timeScale == 1.0) ? 0.1 : 1.0;
+                if (e.getKeyCode() == KeyEvent.VK_Z && e.isControlDown()) {
+                    if (e.isShiftDown()) CommandHistory.redo();
+                    else CommandHistory.undo();
+                }
+                if (e.getKeyCode() == KeyEvent.VK_Y && e.isControlDown()) CommandHistory.redo();
+
                 if (e.getKeyCode() == KeyEvent.VK_A) keyA = true; if (e.getKeyCode() == KeyEvent.VK_D) keyD = true;
                 if (e.getKeyCode() == KeyEvent.VK_W) keyW = true; if (e.getKeyCode() == KeyEvent.VK_S) keyS = true;
                 if (e.getKeyCode() == KeyEvent.VK_I) keyI = true; if (e.getKeyCode() == KeyEvent.VK_O) keyO = true;
@@ -351,6 +573,12 @@ public class Main extends JPanel implements ActionListener {
                 }
                 if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_V) {
                     if (clipboardData != null) pasteFromClipboard(currentMouseWorldPos);
+                }
+                if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_S) {
+                    savePrefab();
+                }
+                if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_L) {
+                    loadPrefab();
                 }
 
                 if (currentMode == ToolMode.SHOOT) {
@@ -409,6 +637,16 @@ public class Main extends JPanel implements ActionListener {
             toggleItem.addActionListener(e -> node.isToggleMode = toggleItem.isSelected()); menu.add(toggleItem);
         }
         
+        if (node.type == LogicNode.NodeType.INPUT_PROXIMITY) {
+            JMenuItem rangeItem = new JMenuItem("Set Proximity Range (Current: " + node.outputDistance + ")");
+            rangeItem.addActionListener(e -> { String val = JOptionPane.showInputDialog("Enter range in pixels:", node.outputDistance); if (val != null) try { node.outputDistance = Double.parseDouble(val); } catch(Exception ex){} });
+            menu.add(rangeItem);
+        }
+        if (node.type == LogicNode.NodeType.INPUT_SPEEDOMETER) {
+            JMenuItem speedItem = new JMenuItem("Set Speed Threshold (Current: " + node.outputSpeed + ")");
+            speedItem.addActionListener(e -> { String val = JOptionPane.showInputDialog("Enter speed threshold:", node.outputSpeed); if (val != null) try { node.outputSpeed = Double.parseDouble(val); } catch(Exception ex){} });
+            menu.add(speedItem);
+        }
         if (node.type == LogicNode.NodeType.INPUT_PRESSURE_PLATE) {
             JMenuItem massItem = new JMenuItem("Set Mass Threshold (Current: " + node.massThreshold + ")");
             massItem.addActionListener(e -> { String val = JOptionPane.showInputDialog("Enter mass limit (e.g. 5, 20):", node.massThreshold); if (val != null) try { node.massThreshold = Double.parseDouble(val); } catch(Exception ex){} });
@@ -518,17 +756,7 @@ public class Main extends JPanel implements ActionListener {
             else placementRotation += 0.05;
         }
 
-        if (isPlaying) {
-            if (activePlayer != null && !activePlayer.isDestroyed) {
-                Vector2D vel = activePlayer.getVelocity(); double targetVx = 0, targetVy = 0;
-                if (keyA) targetVx = -500; if (keyD) targetVx = 500;  
-                if (keyW) targetVy = -500; if (keyS) targetVy = 500;
-                activePlayer.setVelocity(new Vector2D(vel.x + (targetVx - vel.x) * 0.15, vel.y + (targetVy - vel.y) * 0.15));
-                activePlayer.wakeUp();
-                camX += (activePlayer.getPosition().x - camX) * 0.05; camY += (activePlayer.getPosition().y - camY) * 0.05;
-            }
-            engine.step(0.016);
-        }
+        // Physics step removed here, handled by physicsThread
         repaint();
     }
 
@@ -536,6 +764,16 @@ public class Main extends JPanel implements ActionListener {
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
         Graphics2D g2d = (Graphics2D) g;
+
+        AffineTransform oldTx1 = g2d.getTransform();
+        g2d.translate(getWidth() / 2.0, getHeight() / 2.0); g2d.scale(zoom, zoom); g2d.translate(-camX, -camY);
+        synchronized(engine.getWaterZones()) {
+            for (WaterZone wz : engine.getWaterZones()) {
+                g2d.setColor(new Color(0, 100, 255, 80));
+                g2d.fillRect((int)wz.bounds.minX, (int)wz.bounds.minY, (int)(wz.bounds.maxX - wz.bounds.minX), (int)(wz.bounds.maxY - wz.bounds.minY));
+            }
+        }
+        g2d.setTransform(oldTx1);
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
         AffineTransform oldTx = g2d.getTransform();
@@ -551,22 +789,29 @@ public class Main extends JPanel implements ActionListener {
             g2d.drawLine((int)(camX - getWidth()/(2*zoom) - gridSize), y, (int)(camX + getWidth()/(2*zoom) + gridSize), y);
 
         g2d.setColor(WALL_COLOR); g2d.setStroke(WALL_STROKE);
-        for (WallBody wall : engine.getWalls()) g2d.drawLine((int)wall.p1.x, (int)wall.p1.y, (int)wall.p2.x, (int)wall.p2.y);
+        synchronized(engine.getWalls()) {
+            for (WallBody wall : engine.getWalls()) g2d.drawLine((int)wall.p1.x, (int)wall.p1.y, (int)wall.p2.x, (int)wall.p2.y);
+        }
 
         g2d.setColor(new Color(255, 140, 0, 180)); 
         g2d.setStroke(new BasicStroke(10.0f / (float)zoom, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-        for(WeldConstraint w : engine.getWeldConstraints()) {
-            g2d.drawLine((int)w.a.getPosition().x, (int)w.a.getPosition().y, (int)w.b.getPosition().x, (int)w.b.getPosition().y);
+        synchronized(engine.getWeldConstraints()) {
+            for(WeldConstraint w : engine.getWeldConstraints()) {
+                g2d.drawLine((int)w.a.getPosition().x, (int)w.a.getPosition().y, (int)w.b.getPosition().x, (int)w.b.getPosition().y);
+            }
         }
 
         g2d.setColor(new Color(150, 150, 150)); 
         g2d.setStroke(new BasicStroke(6.0f / (float)zoom, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-        for(Constraint c : engine.getConstraints()) {
-            if(c.a.logicNode != null && c.a.logicNode.type == LogicNode.NodeType.INPUT_TRIPWIRE) continue; 
-            g2d.drawLine((int)c.a.getPosition().x, (int)c.a.getPosition().y, (int)c.b.getPosition().x, (int)c.b.getPosition().y);
+        synchronized(engine.getConstraints()) {
+            for(Constraint c : engine.getConstraints()) {
+                if(c.a.logicNode != null && c.a.logicNode.type == LogicNode.NodeType.INPUT_TRIPWIRE) continue;
+                g2d.drawLine((int)c.a.getPosition().x, (int)c.a.getPosition().y, (int)c.b.getPosition().x, (int)c.b.getPosition().y);
+            }
         }
 
-        for (Ball b : engine.getBalls()) {
+        synchronized(engine.getBalls()) {
+            for (Ball b : engine.getBalls()) {
             if (b.logicNode != null && b.logicNode.type == LogicNode.NodeType.OUTPUT_LASER && b.logicNode.laserEndPos != null) {
                 g2d.setColor(new Color(255, 0, 0, 160)); 
                 g2d.setStroke(new BasicStroke(6.0f / (float)zoom));
@@ -575,18 +820,18 @@ public class Main extends JPanel implements ActionListener {
             }
         }
 
-        for (Ball b : engine.getBalls()) {
-            if (b.logicNode != null && b.logicNode.type == LogicNode.NodeType.INPUT_TRIPWIRE && b.logicNode.pairedNode != null && !b.logicNode.pairedNode.parentBody.isDestroyed) {
-                if (b.hashCode() < b.logicNode.pairedNode.hashCode()) { 
-                    g2d.setColor(b.logicNode.currentState ? new Color(255, 0, 0, 50) : Color.RED);
-                    g2d.setStroke(new BasicStroke(2.0f / (float)zoom));
-                    g2d.drawLine((int)b.getPosition().x, (int)b.getPosition().y, (int)b.logicNode.pairedNode.parentBody.getPosition().x, (int)b.logicNode.pairedNode.parentBody.getPosition().y);
+            for (Ball b : engine.getBalls()) {
+                if (b.logicNode != null && b.logicNode.type == LogicNode.NodeType.INPUT_TRIPWIRE && b.logicNode.pairedNode != null && !b.logicNode.pairedNode.parentBody.isDestroyed) {
+                    if (b.hashCode() < b.logicNode.pairedNode.hashCode()) {
+                        g2d.setColor(b.logicNode.currentState ? new Color(255, 0, 0, 50) : Color.RED);
+                        g2d.setStroke(new BasicStroke(2.0f / (float)zoom));
+                        g2d.drawLine((int)b.getPosition().x, (int)b.getPosition().y, (int)b.logicNode.pairedNode.parentBody.getPosition().x, (int)b.logicNode.pairedNode.parentBody.getPosition().y);
+                    }
                 }
             }
-        }
 
-        for (Ball b : engine.getBalls()) {
-            if (b.logicNode != null) {
+            for (Ball b : engine.getBalls()) {
+                if (b.logicNode != null) {
                 if (b.logicNode.type == LogicNode.NodeType.OUTPUT_PISTON && b.originalPosition != null) {
                     g2d.setColor(Color.GRAY); g2d.setStroke(new BasicStroke(16.0f / (float)zoom));
                     g2d.drawLine((int)b.originalPosition.x, (int)b.originalPosition.y, (int)b.getPosition().x, (int)b.getPosition().y);
@@ -605,19 +850,26 @@ public class Main extends JPanel implements ActionListener {
             }
         }
 
-        for (Ball b : engine.getBalls()) {
-            if (b.logicNode != null) {
-                for (LogicNode target : b.logicNode.connectedOutputs) {
-                    Vector2D p1 = b.getPosition(); Vector2D p2 = target.parentBody.getPosition();
-                    Vector2D control = new Vector2D((p1.x + p2.x) / 2, Math.max(p1.y, p2.y) + 100);
-                    java.awt.geom.Path2D path = new java.awt.geom.Path2D.Double();
-                    path.moveTo(p1.x, p1.y); path.quadTo(control.x, control.y, p2.x, p2.y);
-                    g2d.setColor(b.logicNode.currentState ? NEON_GREEN : Color.GRAY); 
-                    g2d.setStroke(new BasicStroke((b.logicNode.currentState ? 4.0f : 2.0f) / (float)zoom));
-                    g2d.draw(path);
+            for (Ball b : engine.getBalls()) {
+                if (b.logicNode != null) {
+                    for (LogicNode target : b.logicNode.connectedOutputs) {
+                        Vector2D p1 = b.getPosition(); Vector2D p2 = target.parentBody.getPosition();
+
+                        // Bezier curve for wires
+                        double dist = p1.distanceTo(p2);
+                        Vector2D ctrl1 = p1.add(new Vector2D(0, dist * 0.5));
+                        Vector2D ctrl2 = p2.add(new Vector2D(0, dist * 0.5));
+
+                        java.awt.geom.Path2D path = new java.awt.geom.Path2D.Double();
+                        path.moveTo(p1.x, p1.y);
+                        path.curveTo(ctrl1.x, ctrl1.y, ctrl2.x, ctrl2.y, p2.x, p2.y);
+
+                        g2d.setColor(b.logicNode.currentState ? NEON_GREEN : Color.GRAY);
+                        g2d.setStroke(new BasicStroke((b.logicNode.currentState ? 4.0f : 2.0f) / (float)zoom));
+                        g2d.draw(path);
+                    }
                 }
             }
-        }
         
         if (currentMode == ToolMode.CONFIGURE && wireStartNode != null) {
             Vector2D p1 = wireStartNode.parentBody.getPosition();
@@ -703,12 +955,13 @@ public class Main extends JPanel implements ActionListener {
             }
         }
         
-        // Draw secondary state for SR Latch
-        if (debugMode) {
-            for (Ball b : engine.getBalls()) {
-                if (b.logicNode != null && b.logicNode.type == LogicNode.NodeType.SR_LATCH) {
-                    g2d.setColor(b.logicNode.secondaryState ? Color.RED : Color.BLUE); // Indicate Q-bar state
-                    g2d.fillOval((int)b.getPosition().x + (int)b.getRadius() - 5, (int)b.getPosition().y - (int)b.getRadius() - 5, 10, 10);
+            // Draw secondary state for SR Latch
+            if (debugMode) {
+                for (Ball b : engine.getBalls()) {
+                    if (b.logicNode != null && b.logicNode.type == LogicNode.NodeType.SR_LATCH) {
+                        g2d.setColor(b.logicNode.secondaryState ? Color.RED : Color.BLUE); // Indicate Q-bar state
+                        g2d.fillOval((int)b.getPosition().x + (int)b.getRadius() - 5, (int)b.getPosition().y - (int)b.getRadius() - 5, 10, 10);
+                    }
                 }
             }
         }
@@ -722,7 +975,30 @@ public class Main extends JPanel implements ActionListener {
             double angle = hoveredBall.getAngle();
             g2d.drawLine(cx, cy, (int)(cx + Math.cos(angle) * radius), (int)(cy + Math.sin(angle) * radius));
             g2d.fillOval(cx - 4, cy - 4, 8, 8);
-        } else if (currentMode == ToolMode.PLACE) {
+        }
+
+        for (Ball b : selectedBalls) {
+            g2d.setColor(new Color(255, 255, 0, 180));
+            g2d.setStroke(new BasicStroke(3.0f / (float)zoom));
+            int cx = (int)b.getPosition().x; int cy = (int)b.getPosition().y;
+            int radius = (int)b.getRadius() + 10;
+            g2d.drawOval(cx - radius, cy - radius, radius * 2, radius * 2);
+        }
+
+        if (selectionStart != null) {
+            Vector2D worldStart = screenToWorld(selectionStart);
+            g2d.setColor(new Color(255, 255, 255, 100));
+            g2d.setStroke(new BasicStroke(1.0f / (float)zoom));
+            double x = Math.min(worldStart.x, currentMouseWorldPos.x);
+            double y = Math.min(worldStart.y, currentMouseWorldPos.y);
+            double w = Math.abs(worldStart.x - currentMouseWorldPos.x);
+            double h = Math.abs(worldStart.y - currentMouseWorldPos.y);
+            g2d.drawRect((int)x, (int)y, (int)w, (int)h);
+            g2d.setColor(new Color(255, 255, 255, 50));
+            g2d.fillRect((int)x, (int)y, (int)w, (int)h);
+        }
+
+        if (currentMode == ToolMode.PLACE) {
             g2d.setColor(new Color(255, 255, 255, 120)); 
             g2d.setStroke(new BasicStroke(2.0f / (float)zoom));
             int px = (int)currentMouseWorldPos.x; int py = (int)currentMouseWorldPos.y;
@@ -731,10 +1007,12 @@ public class Main extends JPanel implements ActionListener {
             g2d.drawLine(px, py, (int)(px + Math.cos(placementRotation) * pr), (int)(py + Math.sin(placementRotation) * pr));
         }
 
-        for (Particle p : engine.getParticles()) {
-            int alpha = Math.max(0, Math.min(255, (int)(255 * (p.life / p.maxLife))));
-            g2d.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), alpha));
-            int s = (int)p.size; g2d.fillRect((int)p.position.x - s/2, (int)p.position.y - s/2, s, s);
+        synchronized(engine.getParticles()) {
+            for (Particle p : engine.getParticles()) {
+                int alpha = Math.max(0, Math.min(255, (int)(255 * (p.life / p.maxLife))));
+                g2d.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), alpha));
+                int s = (int)p.size; g2d.fillRect((int)p.position.x - s/2, (int)p.position.y - s/2, s, s);
+            }
         }
 
         if (currentMode == ToolMode.SHOOT && activePlayer != null) {
@@ -757,7 +1035,12 @@ public class Main extends JPanel implements ActionListener {
         g2d.setColor(OVERLAY_COLOR); g2d.fillRect(10, 10, 430, 460); 
         g2d.setColor(Color.WHITE); g2d.setFont(UI_FONT); int y = 30;
         g2d.setColor(isPlaying ? NEON_GREEN : STATIC_COLOR);
-        g2d.drawString(isPlaying ? "  SIMULATION RUNNING" : "  EDITOR PAUSED", 20, y); y += 30;
+        g2d.drawString(isPlaying ? "  SIMULATION RUNNING" : "  EDITOR PAUSED", 20, y);
+        if (timeScale != 1.0) {
+            g2d.setColor(Color.YELLOW);
+            g2d.drawString(" [SLOW MOTION]", 220, y);
+        }
+        y += 30;
         
         g2d.setColor(Color.WHITE); g2d.drawString("CURRENT TOOL MODE:", 20, y); y += 20;
         g2d.setColor(currentMode == ToolMode.PLACE ? DYNAMIC_COLOR : Color.GRAY);    g2d.drawString("[1] PLACE: " + currentSpawn.name().replace("_", " "), 20, y); y += 20;
@@ -770,15 +1053,39 @@ public class Main extends JPanel implements ActionListener {
         g2d.setColor(Color.WHITE); g2d.drawString("INSTRUCTIONS:", 20, y); y += 20;
         g2d.setColor(Color.LIGHT_GRAY);
         g2d.drawString("[Ctrl+C / Ctrl+V] Copy & Paste hovered item", 20, y); y += 20; 
+        g2d.drawString("[Ctrl+S / Ctrl+L] Save & Load selection", 20, y); y += 20;
         g2d.drawString("[LEFT/RIGHT/R] Rotate Entity", 20, y); y += 20; 
-        g2d.drawString("Right-Click in PLACE mode: Pick Item", 20, y); y += 20;
-        g2d.drawString("Right-Click in WIRE mode: Configure Node", 20, y); y += 20;
+        g2d.drawString("[Ctrl+Z/Y] Undo/Redo | [T] Slow Motion", 20, y); y += 20;
+        g2d.drawString("Drag in DRAG mode: Box Select", 20, y); y += 20;
         g2d.drawString("WASD: Fly/Control Logic | I/O: Zoom", 20, y);
     }
 
+    private LWJGLRenderer renderer;
+    private AudioEngine audioEngine;
+    private boolean useLWJGL = false;
+
     public static void main(String[] args) {
-        JFrame frame = new JFrame("Physics Logic Sandbox");
-        Main editor = new Main(1280, 720);
-        frame.add(editor); frame.setExtendedState(JFrame.MAXIMIZED_BOTH); frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE); frame.setVisible(true);
+        if (args.length > 0 && args[0].equalsIgnoreCase("lwjgl")) {
+            new Main(1280, 720).runLWJGL();
+        } else {
+            JFrame frame = new JFrame("Physics Logic Sandbox");
+            Main editor = new Main(1280, 720);
+            frame.add(editor); frame.setExtendedState(JFrame.MAXIMIZED_BOTH); frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE); frame.setVisible(true);
+        }
+    }
+
+    public void runLWJGL() {
+        useLWJGL = true;
+        renderer = new LWJGLRenderer();
+        renderer.init(1280, 720);
+
+        while (!renderer.shouldClose() && running) {
+            renderer.render(engine, camX, camY, zoom);
+            try { Thread.sleep(10); } catch (InterruptedException e) {}
+        }
+
+        running = false;
+        renderer.cleanup();
+        System.exit(0);
     }
 }

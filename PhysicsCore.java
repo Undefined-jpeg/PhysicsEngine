@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class PhysicsCore {
+    public static AudioEngine audioEngine;
     public static final double GRAVITY = 9.81 * 100;
     public static final double ROLL_THRESHOLD = 40.0;
 
@@ -152,6 +153,9 @@ public class PhysicsCore {
             double impact = relativeVelocity.dot(wallNormal);
 
             if (impact < 0) {
+                if (audioEngine != null && Math.abs(impact) > 100) {
+                    audioEngine.playSound("thud", (float)Math.min(1.0, Math.abs(impact) / 2000.0), 0.8f + (float)Math.random() * 0.4f);
+                }
                 double rBCrossN = rB.cross(wallNormal);
                 double angularEffect = rBCrossN * rBCrossN * invInertia;
                 double e = Math.abs(impact) < ROLL_THRESHOLD ? 0 : entity.getRestitution();
@@ -303,8 +307,8 @@ public class PhysicsCore {
         double massSum = invMassA + invMassB;
         
         // 1. Positional correction (Baumgarte Stabilization)
-        // Scaled down 'percent' to 0.2 because the Warm Starter handles most of the resistance now.
-        double percent = 0.2, slop = 0.05;
+        // Increased percent slightly for better stability in stacking
+        double percent = 0.3, slop = 0.01;
         Vector2D correction = normal.multiply(Math.max(overlap - slop, 0.0) * percent / massSum);
         if (!a.isStatic) a.setPosition(a.getPosition().subtract(correction.multiply(invMassA)));
         if (!b.isStatic) b.setPosition(b.getPosition().add(correction.multiply(invMassB)));
@@ -331,6 +335,10 @@ public class PhysicsCore {
                     .subtract(a.getVelocity().add(new Vector2D(-a.getAngularVelocity() * rA.y, a.getAngularVelocity() * rA.x)));
             
             double impact = relativeVelocity.dot(normal);
+
+            if (audioEngine != null && Math.abs(impact) > 100) {
+                audioEngine.playSound("thud", (float)Math.min(1.0, Math.abs(impact) / 2000.0), 0.8f + (float)Math.random() * 0.4f);
+            }
 
             // NORMAL IMPULSE (BOUNCE & RESTING)
             double rACrossN = rA.cross(normal);
@@ -376,7 +384,9 @@ public class PhysicsCore {
             double jt = -relVelTangent / massTangent;
             
             // Friction is clamped based on the actual normal force applied this frame (Coulomb's Law)
-            double maxFriction = newAccumulatedNormal * ((a.getFriction() + b.getFriction()) / 2.0);
+            // Using a slightly higher friction combining for stability
+            double staticFriction = Math.sqrt(a.getFriction() * a.getFriction() + b.getFriction() * b.getFriction());
+            double maxFriction = newAccumulatedNormal * staticFriction;
             
             double oldAccumulatedFriction = frictionImpulseCache.getOrDefault(contactId, 0.0);
             double newAccumulatedFriction = Math.max(-maxFriction, Math.min(oldAccumulatedFriction + jt, maxFriction));

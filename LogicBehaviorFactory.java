@@ -22,6 +22,8 @@ public class LogicBehaviorFactory {
             case INPUT_KEY_S -> new InputKeyBehavior(InputKeyBehavior.KeyType.S);
             case INPUT_KEY_D -> new InputKeyBehavior(InputKeyBehavior.KeyType.D);
             case INPUT_SENSOR -> new InputSensorBehavior();
+            case INPUT_PROXIMITY -> new InputProximityBehavior();
+            case INPUT_SPEEDOMETER -> new InputSpeedometerBehavior();
             case OUTPUT_DOOR -> new OutputDoorBehavior();
             case OUTPUT_PLATFORM -> new OutputPlatformBehavior();
             case OUTPUT_PISTON -> new OutputPistonBehavior();
@@ -37,6 +39,7 @@ public class LogicBehaviorFactory {
             case SR_LATCH -> new SrLatchBehavior();
             case GATE_TIMER -> new GateTimerBehavior();
             case GATE_COUNTER -> new GateCounterBehavior();
+            case RELAY -> new RelayBehavior();
             default -> new DefaultLogicBehavior();
         };
     }
@@ -127,6 +130,30 @@ public class LogicBehaviorFactory {
         @Override public void preEvaluate(LogicNode node, EngineContainer engine, double dt) { node.currentState = false; } // Reset sensor
     }
 
+    private static class InputProximityBehavior extends DefaultLogicBehavior {
+        @Override public void preEvaluate(LogicNode node, EngineContainer engine, double dt) {
+            double range = node.outputDistance;
+            AABB sensorBox = new AABB(node.parentBody.getPosition().x - range, node.parentBody.getPosition().y - range,
+                                      node.parentBody.getPosition().x + range, node.parentBody.getPosition().y + range);
+            node.currentState = false;
+            for (Ball other : engine.getBalls()) {
+                if (other != node.parentBody && !other.isNoClip && sensorBox.intersects(other.getAABB())) {
+                    if (node.parentBody.getPosition().distanceTo(other.getPosition()) <= range) {
+                        node.currentState = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static class InputSpeedometerBehavior extends DefaultLogicBehavior {
+        @Override public void preEvaluate(LogicNode node, EngineContainer engine, double dt) {
+            double speed = node.parentBody.getVelocity().length();
+            node.currentState = speed >= node.outputSpeed;
+        }
+    }
+
     // --- Gate Behaviors ---
     private static class LightbulbBehavior extends DefaultLogicBehavior {
         @Override public void evaluate(LogicNode node, EngineContainer engine, double dt) {
@@ -212,6 +239,12 @@ public class LogicBehaviorFactory {
                 node.currentState = false;
             }
             node.previousInputState = inputActivated;
+        }
+    }
+
+    private static class RelayBehavior extends DefaultLogicBehavior {
+        @Override public void evaluate(LogicNode node, EngineContainer engine, double dt) {
+            node.currentState = isActivated(node);
         }
     }
 
