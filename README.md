@@ -28,17 +28,17 @@ This project requires the following libraries:
 ## Compiling and Running
 To compile the project:
 ```bash
-javac -cp .:gson-2.10.1.jar:lwjgl/* *.java
+javac -d out -cp .:gson-2.10.1.jar:lwjgl/* $(find src -name "*.java")
 ```
 
 To run with the standard Swing renderer:
 ```bash
-java -cp .:gson-2.10.1.jar:lwjgl/* Main
+java -cp out:gson-2.10.1.jar:lwjgl/* sandbox.editor.Main
 ```
 
 To run with the hardware-accelerated LWJGL renderer:
 ```bash
-java -cp .:gson-2.10.1.jar:lwjgl/* Main lwjgl
+java -cp out:gson-2.10.1.jar:lwjgl/* sandbox.editor.Main lwjgl
 ```
 
 ## Controls
